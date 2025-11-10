@@ -4,14 +4,13 @@ import tempfile
 from collections import defaultdict, Counter
 
 import pandas as pd
-import gradio as gr
+import streamlit as st
 from unidecode import unidecode
 
 # =========================
 # Config / Paths
 # =========================
-REPO_PATH = os.environ.get("REPO_PATH", "./master_repository.parquet")  # persistent if volume mounted at /data
-ALLOWED_MASTER_EXTS = {".csv",".xlsx",".xls",".parquet",".pq"}
+REPO_PATH = os.environ.get("REPO_PATH", "./master_repository.parquet")  # set to /data/master_repository.parquet on Railway
 
 # =========================
 # Column detection helpers
@@ -27,7 +26,7 @@ ALIASES_COMPANY = ["Company","Company Name","Account","Account Name","Organisati
 ALIASES_EMAIL   = ["Email","Email Address","Primary Email","Work Email","Business Email","E-mail","Email(2)"]
 ALIASES_FIRST   = ["First Name","Firstname","Given Name","Forename","First"]
 ALIASES_LAST    = ["Last Name","Lastname","Surname","Family Name","Last"]
-ALIASES_DOMAIN  = ["Domain","Company Domain","Website","Company Website","Company Domain/Website","Domain(2)"]  # optional in working
+ALIASES_DOMAIN  = ["Domain","Company Domain","Website","Company Website","Company Domain/Website","Domain(2)"]  # optional
 ALIASES_COUNTRY = ["Country","Company Country","Office Country","HQ Country","Country/Region"]                   # optional
 
 SEPARATORS = ["", ".", "_", "-"]
@@ -90,7 +89,6 @@ def pattern_candidates(first, last):
             ("last.f",     f"{l}{sep}{fi}"),
             ("first",      f"{f}"),
         ])
-    # de-dupe preserving order
     seen, uniq = set(), []
     for k,v in cands:
         if (k,v) not in seen:
@@ -193,17 +191,13 @@ def load_repo():
     return pd.DataFrame(columns=REPO_SCHEMA)
 
 def save_repo(df_repo):
-    # ensure dtypes
     df_repo = df_repo.copy()
     if "count" in df_repo.columns:
         df_repo["count"] = df_repo["count"].astype("int64")
     df_repo.to_parquet(REPO_PATH, compression="snappy")
 
 def add_examples_to_repo(df_input):
-    """
-    From any uploaded dataset (master or working), extract rows that HAVE emails,
-    parse company/country/domain/pattern, and merge into the persistent repo.
-    """
+    """Extract rows WITH emails → (company, country, domain, pattern, count=1), merge into persistent repo."""
     repo = load_repo()
     df = ensure_cols(df_input)
 
@@ -212,11 +206,9 @@ def add_examples_to_repo(df_input):
         company = (r["Company"] or "")
         company_key = unidecode(str(company)).strip().lower()
         country_norm = normalize_country(r["Country"]) if "Country" in df.columns else None
-
         first, last, email = r["First Name"], r["Last Name"], str(r["Email"]).strip()
         dom = extract_domain(email)
         pat = detect_email_pattern(first, last, email)
-
         if company_key and dom and pat:
             rows.append([company_key, country_norm, dom, pat, 1])
 
@@ -224,7 +216,6 @@ def add_examples_to_repo(df_input):
         return load_repo()
 
     new = pd.DataFrame(rows, columns=REPO_SCHEMA)
-    # merge by group and sum counts
     combined = pd.concat([repo, new], ignore_index=True)
     combined = (combined.groupby(["company","country_norm","domain","pattern"], as_index=False)
                         .agg(count=("count","sum")))
@@ -244,20 +235,11 @@ def choose_best_domain(domains, country_norm):
         return sorted(coms, key=lambda d: (-cnt[d], d))[0]
     return sorted(cnt.keys(), key=lambda d: (-cnt[d], d))[0]
 
-# =========================
-# Build in-memory maps from repo
-# =========================
 def build_maps_from_repo(df_repo):
-    """
-    Returns:
-      repo_by_domain: {domain -> {pattern -> count}}
-      repo_cc: { (company|country) -> {pattern: [domains...] (expanded by count)} }
-      repo_c:  { company -> {pattern: [domains...] (expanded by count)} }
-    """
+    """Build maps for fast lookup."""
     repo_by_domain = defaultdict(lambda: defaultdict(int))
     repo_cc = defaultdict(lambda: defaultdict(list))
     repo_c  = defaultdict(lambda: defaultdict(list))
-
     for _, r in df_repo.iterrows():
         company = r["company"]; country_norm = r["country_norm"]
         dom = r["domain"]; pat = r["pattern"]; count = int(r["count"])
@@ -269,9 +251,6 @@ def build_maps_from_repo(df_repo):
                 repo_cc[key][pat].append(dom)
     return repo_by_domain, repo_cc, repo_c
 
-# =========================
-# Learn from current dataset (for extra signal)
-# =========================
 def learn_from_dataset(df):
     df = ensure_cols(df)
     cc = defaultdict(lambda: defaultdict(list))
@@ -287,11 +266,8 @@ def learn_from_dataset(df):
                 cc[f"{company}|{country_norm}"][pat].append(dom)
     return cc, c
 
-# =========================
-# Fill logic
-# =========================
 def best_from_sources(company_key, country_norm, repo_cc, repo_c, cc_data, c_data):
-    # company+country → master repo then data
+    # company+country → repo then data
     if country_norm:
         key = f"{company_key}|{country_norm}"
         for src_tag, src in (("REPO company+country", repo_cc), ("DATA company+country", cc_data)):
@@ -311,7 +287,7 @@ def best_from_sources(company_key, country_norm, repo_cc, repo_c, cc_data, c_dat
                 if best_dom: return pat, best_dom, src_tag
     return None, None, None
 
-def fill_missing_emails(df, learn_from_this_file=False, output_excel=True):
+def fill_missing_emails(df, learn_from_this_file=False):
     df = ensure_cols(df)
 
     # audit columns
@@ -319,18 +295,15 @@ def fill_missing_emails(df, learn_from_this_file=False, output_excel=True):
         if col not in df.columns: df[col] = pd.NA
     df["Email_Filled"] = df["Email_Filled"].fillna("No")
 
-    # 1) optionally ingest this file's known emails into the persistent repo
+    # learn from this file first (incremental)
     if learn_from_this_file:
         add_examples_to_repo(df)
 
-    # 2) load repo & build maps
     repo_df = load_repo()
-    repo_by_domain, repo_cc, repo_c = build_maps_from_repo(repo_df)
-
-    # 3) learn from dataset (extra hints)
+    _, repo_cc, repo_c = build_maps_from_repo(repo_df)
     cc_data, c_data = learn_from_dataset(df)
 
-    # 4) fill
+    # fill
     to_fill = df.index[df["Email"].isna()].tolist()
     for idx in to_fill:
         r = df.loc[idx]
@@ -349,7 +322,7 @@ def fill_missing_emails(df, learn_from_this_file=False, output_excel=True):
                 df.at[idx,"Email_Fill_Reason"] = f"Filled via {src_tag} (pattern '{pat}', domain '{domain}')"
                 df.at[idx,"Domain_Guess"] = domain
 
-    # 5) audit existing emails (pattern + domain guess)
+    # audit: existing emails → pattern + domain guess
     detected = []
     for i, r in df.iterrows():
         if pd.isna(r["Email"]):
@@ -361,77 +334,83 @@ def fill_missing_emails(df, learn_from_this_file=False, output_excel=True):
                 df.at[i,"Domain_Guess"] = dom
     df["Email_Pattern_Detected"] = detected
 
-    # 6) save result
-    tmpdir = tempfile.mkdtemp()
-    out_path = os.path.join(tmpdir, "emails_filled.xlsx" if output_excel else "emails_filled.csv")
-    if output_excel: df.to_excel(out_path, index=False)
-    else:            df.to_csv(out_path, index=False)
-    return out_path, df
+    return df
 
 # =========================
-# File loaders
+# File loader
 # =========================
-def load_df(path):
-    ext = os.path.splitext(path)[1].lower()
+def load_df(uploaded_file):
+    if uploaded_file is None: return None
+    name = uploaded_file.name
+    ext = os.path.splitext(name)[1].lower()
     if ext in [".xlsx",".xlsm",".xltx",".xltm",".xls"]:
-        return pd.read_excel(path)
+        return pd.read_excel(uploaded_file)
     if ext == ".csv":
-        return pd.read_csv(path, keep_default_na=True, low_memory=False)
+        return pd.read_csv(uploaded_file, keep_default_na=True, low_memory=False)
     if ext in [".parquet",".pq"]:
-        return pd.read_parquet(path)
-    raise gr.Error(f"Unsupported file type: {ext}")
+        return pd.read_parquet(uploaded_file)
+    st.error(f"Unsupported file type: {ext}")
+    return None
 
 # =========================
-# Gradio UI
+# Streamlit UI
 # =========================
-with gr.Blocks(title="Email Format Filler (Persistent Repo)") as demo:
-    gr.Markdown("""
-    ### Email Format Filler (Persistent Repository)
-    - **Tab 1 – Initialize/Replace Master**: Upload your large master once. We parse only the needed columns and persist to disk.
-    - **Tab 2 – Fill Missing Emails**: Upload working files anytime. Optionally **learn** from rows that already have emails, then fill the blanks.
-    """)
+st.set_page_config(page_title="Email Format Filler", layout="wide")
+st.title("Email Format Filler (Persistent Repository)")
 
-    with gr.Tab("Initialize / Replace Master"):
-        master_file = gr.File(label="Master Repository (CSV/XLSX/Parquet)", file_count="single", type="filepath")
-        init_btn = gr.Button("Build / Replace Persistent Repository", variant="primary")
-        repo_stats = gr.JSON(label="Repository Summary")
-        download_repo = gr.File(label="Download Current Repository")
+tab_init, tab_fill = st.tabs(["Initialize / Replace Master", "Fill Missing Emails"])
 
-        def init_repo(path):
-            if not path: raise gr.Error("Please upload a Master Repository file.")
-            ext = os.path.splitext(path)[1].lower()
-            if ext not in ALLOWED_MASTER_EXTS:
-                raise gr.Error(f"Unsupported master type: {ext}")
-            df = load_df(path)
-            repo = add_examples_to_repo(df)  # this replaces/merges; if you want REPLACE, delete existing first
-            # Save current repo again to ensure persisted
-            save_repo(repo)
-            # Simple stats
-            total_rows = int(repo["count"].sum()) if not repo.empty else 0
-            unique_keys = int(repo.shape[0])
-            # sample
-            tmp = tempfile.mkdtemp()
-            repo_path = os.path.join(tmp, "master_repository.parquet")
-            repo.to_parquet(repo_path, compression="snappy")
-            return {"unique_keys": unique_keys, "total_examples": total_rows}, repo_path
+with tab_init:
+    st.markdown("Upload your large master **once**. We’ll parse what we need and save a compact repository to persistent storage.")
+    master = st.file_uploader("Master Repository (CSV/XLSX/Parquet)", type=["csv","xlsx","xls","parquet","pq"])
+    colA, colB = st.columns([1,1])
+    with colA:
+        if st.button("Build / Replace Persistent Repository", type="primary", use_container_width=True):
+            if not master:
+                st.error("Please upload a Master Repository file.")
+            else:
+                df = load_df(master)
+                repo = add_examples_to_repo(df)
+                save_repo(repo)
+                st.success("Repository built and saved.")
+                st.write({
+                    "unique_keys": int(repo.shape[0]),
+                    "total_examples": int(repo["count"].sum()) if not repo.empty else 0
+                })
+    with colB:
+        if st.button("Download Current Repository", use_container_width=True):
+            repo = load_repo()
+            if repo.empty:
+                st.warning("Repository is empty.")
+            else:
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".parquet")
+                repo.to_parquet(tmp.name, compression="snappy")
+                with open(tmp.name, "rb") as f:
+                    st.download_button("Download .parquet", f, file_name="master_repository.parquet", mime="application/octet-stream")
 
-        init_btn.click(init_repo, inputs=[master_file], outputs=[repo_stats, download_repo])
+with tab_fill:
+    st.markdown("Upload a working Apollo-style file (blank emails allowed). Optionally **learn** from known emails in this file, then fill the blanks.")
+    work = st.file_uploader("Working Dataset (CSV/XLSX)", type=["csv","xlsx","xls"], key="work")
+    learn = st.checkbox("Learn from this file (add existing emails to the repository)", value=True)
+    out_fmt = st.radio("Output format", ["Excel (.xlsx)","CSV (.csv)"], horizontal=True)
 
-    with gr.Tab("Fill Missing Emails"):
-        work_file = gr.File(label="Working Dataset (CSV/XLSX)", file_count="single", type="filepath")
-        learn_toggle = gr.Checkbox(value=True, label="Learn from this file (add rows with existing emails to the repository)")
-        out_excel = gr.Checkbox(value=True, label="Output Excel (unchecked = CSV)")
-        run_btn = gr.Button("Run Fill", variant="primary")
-        out_file = gr.File(label="Download Result")
-        preview  = gr.Dataframe(label="Preview (first 100 rows)", interactive=False, height=350)
+    if st.button("Run Fill", type="primary"):
+        if not work:
+            st.error("Please upload a Working Dataset.")
+        else:
+            df = load_df(work)
+            result = fill_missing_emails(df, learn_from_this_file=learn)
+            st.success("Done.")
+            st.dataframe(result.head(100), use_container_width=True)
 
-        def run_fill(work_path, learn_from_file, want_excel):
-            if not work_path: raise gr.Error("Please upload a Working Dataset.")
-            df = load_df(work_path)
-            path, result = fill_missing_emails(df, learn_from_this_file=learn_from_file, output_excel=want_excel)
-            return path, result.head(100)
-
-        run_btn.click(run_fill, inputs=[work_file, learn_toggle, out_excel], outputs=[out_file, preview])
-
-if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", "8080")))
+            if out_fmt.startswith("Excel"):
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+                result.to_excel(tmp.name, index=False)
+                with open(tmp.name, "rb") as f:
+                    st.download_button("Download result (.xlsx)", f, file_name="emails_filled.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            else:
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+                result.to_csv(tmp.name, index=False)
+                with open(tmp.name, "rb") as f:
+                    st.download_button("Download result (.csv)", f, file_name="emails_filled.csv", mime="text/csv")
