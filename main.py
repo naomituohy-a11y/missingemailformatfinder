@@ -52,7 +52,7 @@ def clean_string(x):
     return s if s else pd.NA
 
 def normalize_country(x):
-    if x is None or (isinstance(x, float) and pd.isna(x)): return None
+    if pd.isna(x): return None
     s = str(x).strip().lower()
     return s or None
 
@@ -203,12 +203,24 @@ def add_examples_to_repo(df_input):
 
     rows = []
     for _, r in df.dropna(subset=["Email"]).iterrows():
-        company = (r["Company"] or "")
-        company_key = unidecode(str(company)).strip().lower()
+        # SAFE handling of pd.NA
+        company_raw = "" if pd.isna(r["Company"]) else str(r["Company"])
+        company_key = unidecode(company_raw).strip().lower()
+        if not company_key:
+            continue
+
         country_norm = normalize_country(r["Country"]) if "Country" in df.columns else None
-        first, last, email = r["First Name"], r["Last Name"], str(r["Email"]).strip()
+
+        first = None if pd.isna(r["First Name"]) else r["First Name"]
+        last  = None if pd.isna(r["Last Name"])  else r["Last Name"]
+        email = str(r["Email"]).strip() if not pd.isna(r["Email"]) else None
+
+        if not email:
+            continue
+
         dom = extract_domain(email)
         pat = detect_email_pattern(first, last, email)
+
         if company_key and dom and pat:
             rows.append([company_key, country_norm, dom, pat, 1])
 
@@ -256,9 +268,19 @@ def learn_from_dataset(df):
     cc = defaultdict(lambda: defaultdict(list))
     c  = defaultdict(lambda: defaultdict(list))
     for _, r in df.dropna(subset=["Email"]).iterrows():
-        company = unidecode(str(r["Company"])).strip().lower()
+        company_raw = "" if pd.isna(r["Company"]) else str(r["Company"])
+        company = unidecode(company_raw).strip().lower()
+        if not company:
+            continue
         country_norm = normalize_country(r["Country"]) if "Country" in df.columns else None
-        first, last, email = r["First Name"], r["Last Name"], str(r["Email"]).strip()
+
+        first = None if pd.isna(r["First Name"]) else r["First Name"]
+        last  = None if pd.isna(r["Last Name"])  else r["Last Name"]
+        email = str(r["Email"]).strip() if not pd.isna(r["Email"]) else None
+
+        if not email:
+            continue
+
         dom = extract_domain(email); pat = detect_email_pattern(first, last, email)
         if company and dom and pat:
             c[company][pat].append(dom)
@@ -307,10 +329,17 @@ def fill_missing_emails(df, learn_from_this_file=False):
     to_fill = df.index[df["Email"].isna()].tolist()
     for idx in to_fill:
         r = df.loc[idx]
-        company_key = unidecode(str(r["Company"])).strip().lower() if pd.notna(r["Company"]) else ""
-        if not company_key: continue
-        first, last = r["First Name"], r["Last Name"]
-        if pd.isna(first) or pd.isna(last): continue
+
+        company_raw = "" if pd.isna(r["Company"]) else str(r["Company"])
+        company_key = unidecode(company_raw).strip().lower()
+        if not company_key:
+            continue
+
+        first = None if pd.isna(r["First Name"]) else r["First Name"]
+        last  = None if pd.isna(r["Last Name"])  else r["Last Name"]
+        if first is None or last is None:
+            continue
+
         country_norm = normalize_country(r["Country"]) if "Country" in df.columns else None
 
         pat, domain, src_tag = best_from_sources(company_key, country_norm, repo_cc, repo_c, cc_data, c_data)
@@ -328,9 +357,11 @@ def fill_missing_emails(df, learn_from_this_file=False):
         if pd.isna(r["Email"]):
             detected.append(pd.NA)
         else:
-            detected.append(detect_email_pattern(r["First Name"], r["Last Name"], r["Email"]))
+            first = None if pd.isna(r["First Name"]) else r["First Name"]
+            last  = None if pd.isna(r["Last Name"])  else r["Last Name"]
+            detected.append(detect_email_pattern(first, last, r["Email"]))
             dom = extract_domain(r["Email"])
-            if dom and pd.isna(r.get("Domain_Guess", pd.NA)):
+            if dom and (("Domain_Guess" not in df.columns) or pd.isna(r.get("Domain_Guess", pd.NA))):
                 df.at[i,"Domain_Guess"] = dom
     df["Email_Pattern_Detected"] = detected
 
@@ -341,7 +372,7 @@ def fill_missing_emails(df, learn_from_this_file=False):
 # =========================
 def load_df(uploaded_file):
     if uploaded_file is None: return None
-    name = uploaded_file.name
+    name = uploaded_file.name if hasattr(uploaded_file, "name") else str(uploaded_file)
     ext = os.path.splitext(name)[1].lower()
     if ext in [".xlsx",".xlsm",".xltx",".xltm",".xls"]:
         return pd.read_excel(uploaded_file)
