@@ -1,6 +1,6 @@
 pandas
 openpyxl
 unidecode
-gradio==4.44.0
 pyarrow
 fastparquet
+streamlit==1.39.0
