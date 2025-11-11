@@ -2,6 +2,7 @@ import os
 import re
 import tempfile
 from collections import defaultdict, Counter
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -10,7 +11,8 @@ from unidecode import unidecode
 # =========================
 # Config / Paths
 # =========================
-REPO_PATH = os.environ.get("REPO_PATH", "./master_repository.parquet")  # set to /data/master_repository.parquet on Railway
+REPO_PATH = os.environ.get("REPO_PATH", "./master_repository.parquet")  # tip: set to /data/master_repository.parquet on Railway
+ACTIVITY_LOG_PATH = os.environ.get("ACTIVITY_LOG_PATH", "/data/fill_activity.csv")
 
 # =========================
 # Column detection helpers
@@ -203,7 +205,6 @@ def add_examples_to_repo(df_input):
 
     rows = []
     for _, r in df.dropna(subset=["Email"]).iterrows():
-        # SAFE handling of pd.NA
         company_raw = "" if pd.isna(r["Company"]) else str(r["Company"])
         company_key = unidecode(company_raw).strip().lower()
         if not company_key:
@@ -214,13 +215,11 @@ def add_examples_to_repo(df_input):
         first = None if pd.isna(r["First Name"]) else r["First Name"]
         last  = None if pd.isna(r["Last Name"])  else r["Last Name"]
         email = str(r["Email"]).strip() if not pd.isna(r["Email"]) else None
-
         if not email:
             continue
 
         dom = extract_domain(email)
         pat = detect_email_pattern(first, last, email)
-
         if company_key and dom and pat:
             rows.append([company_key, country_norm, dom, pat, 1])
 
@@ -277,7 +276,6 @@ def learn_from_dataset(df):
         first = None if pd.isna(r["First Name"]) else r["First Name"]
         last  = None if pd.isna(r["Last Name"])  else r["Last Name"]
         email = str(r["Email"]).strip() if not pd.isna(r["Email"]) else None
-
         if not email:
             continue
 
@@ -309,13 +307,15 @@ def best_from_sources(company_key, country_norm, repo_cc, repo_c, cc_data, c_dat
                 if best_dom: return pat, best_dom, src_tag
     return None, None, None
 
-def fill_missing_emails(df, learn_from_this_file=False):
+def fill_missing_emails(df, learn_from_this_file=False, progress_cb=None):
     df = ensure_cols(df)
 
     # audit columns
     for col in ["Email_Filled","Email_Fill_Reason","Email_Pattern_Detected","Domain_Guess"]:
         if col not in df.columns: df[col] = pd.NA
     df["Email_Filled"] = df["Email_Filled"].fillna("No")
+
+    missing_before = int(df["Email"].isna().sum())
 
     # learn from this file first (incremental)
     if learn_from_this_file:
@@ -325,19 +325,24 @@ def fill_missing_emails(df, learn_from_this_file=False):
     _, repo_cc, repo_c = build_maps_from_repo(repo_df)
     cc_data, c_data = learn_from_dataset(df)
 
-    # fill
+    # fill with progress
     to_fill = df.index[df["Email"].isna()].tolist()
-    for idx in to_fill:
+    total = len(to_fill)
+    filled_counter = 0
+
+    for i, idx in enumerate(to_fill, start=1):
         r = df.loc[idx]
 
         company_raw = "" if pd.isna(r["Company"]) else str(r["Company"])
         company_key = unidecode(company_raw).strip().lower()
         if not company_key:
+            if progress_cb: progress_cb(i, total)
             continue
 
         first = None if pd.isna(r["First Name"]) else r["First Name"]
         last  = None if pd.isna(r["Last Name"])  else r["Last Name"]
         if first is None or last is None:
+            if progress_cb: progress_cb(i, total)
             continue
 
         country_norm = normalize_country(r["Country"]) if "Country" in df.columns else None
@@ -350,22 +355,34 @@ def fill_missing_emails(df, learn_from_this_file=False):
                 df.at[idx,"Email_Filled"] = "Yes"
                 df.at[idx,"Email_Fill_Reason"] = f"Filled via {src_tag} (pattern '{pat}', domain '{domain}')"
                 df.at[idx,"Domain_Guess"] = domain
+                filled_counter += 1
+
+        if progress_cb:
+            progress_cb(i, total)
 
     # audit: existing emails → pattern + domain guess
     detected = []
-    for i, r in df.iterrows():
-        if pd.isna(r["Email"]):
+    for i2, r2 in df.iterrows():
+        if pd.isna(r2["Email"]):
             detected.append(pd.NA)
         else:
-            first = None if pd.isna(r["First Name"]) else r["First Name"]
-            last  = None if pd.isna(r["Last Name"])  else r["Last Name"]
-            detected.append(detect_email_pattern(first, last, r["Email"]))
-            dom = extract_domain(r["Email"])
-            if dom and (("Domain_Guess" not in df.columns) or pd.isna(r.get("Domain_Guess", pd.NA))):
-                df.at[i,"Domain_Guess"] = dom
+            first2 = None if pd.isna(r2["First Name"]) else r2["First Name"]
+            last2  = None if pd.isna(r2["Last Name"])  else r2["Last Name"]
+            detected.append(detect_email_pattern(first2, last2, r2["Email"]))
+            dom2 = extract_domain(r2["Email"])
+            if dom2 and (("Domain_Guess" not in df.columns) or pd.isna(r2.get("Domain_Guess", pd.NA))):
+                df.at[i2,"Domain_Guess"] = dom2
     df["Email_Pattern_Detected"] = detected
 
-    return df
+    missing_after = int(df["Email"].isna().sum())
+    stats = {
+        "rows": int(len(df)),
+        "missing_before": missing_before,
+        "filled": int(filled_counter),
+        "missing_after": missing_after,
+        "fill_rate_pct": (filled_counter / missing_before * 100.0) if missing_before else 0.0
+    }
+    return df, stats
 
 # =========================
 # File loader
@@ -429,9 +446,51 @@ with tab_fill:
         if not work:
             st.error("Please upload a Working Dataset.")
         else:
-            df = load_df(work)
-            result = fill_missing_emails(df, learn_from_this_file=learn)
-            st.success("Done.")
+            df_in = load_df(work)
+
+            # progress UI
+            prog = st.progress(0)
+            status_txt = st.empty()
+
+            def progress_cb(done, total):
+                if total > 0:
+                    prog.progress(min(1.0, done/total))
+                    status_txt.write(f"Processing {done:,} / {total:,} missing emails...")
+
+            result, stats = fill_missing_emails(df_in, learn_from_this_file=learn, progress_cb=progress_cb)
+
+            # finish progress
+            prog.progress(1.0)
+            status_txt.write("Processing complete.")
+
+            # summary metrics
+            st.success(f"Filled {stats['filled']:,} of {stats['missing_before']:,} missing emails "
+                       f"({stats['fill_rate_pct']:.1f}%). Remaining missing: {stats['missing_after']:,}.")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total rows", f"{stats['rows']:,}")
+            c2.metric("Filled", f"{stats['filled']:,}")
+            c3.metric("Fill rate", f"{stats['fill_rate_pct']:.1f}%")
+
+            # optional: append run to activity log
+            try:
+                log_row = pd.DataFrame([{
+                    "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    "rows": stats["rows"],
+                    "missing_before": stats["missing_before"],
+                    "filled": stats["filled"],
+                    "missing_after": stats["missing_after"],
+                    "fill_rate_pct": round(stats["fill_rate_pct"], 2),
+                    "learn_from_this_file": bool(learn)
+                }])
+                if os.path.exists(ACTIVITY_LOG_PATH):
+                    log_row.to_csv(ACTIVITY_LOG_PATH, mode="a", header=False, index=False)
+                else:
+                    log_row.to_csv(ACTIVITY_LOG_PATH, index=False)
+                st.caption(f"Run logged to {ACTIVITY_LOG_PATH}")
+            except Exception as e:
+                st.caption(f"Could not write activity log: {e}")
+
+            # preview + download
             st.dataframe(result.head(100), use_container_width=True)
 
             if out_fmt.startswith("Excel"):
