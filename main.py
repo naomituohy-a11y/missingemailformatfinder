@@ -1,506 +1,351 @@
-import os
-import re
-import tempfile
+# app.py — Email Format Filler (Persistent Repository, with Deep Debug)
+# Streamlit single-file app
+
+import os, re, io, time
 from collections import defaultdict, Counter
-from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 from unidecode import unidecode
 
-# =========================
-# Config / Paths
-# =========================
-REPO_PATH = os.environ.get("REPO_PATH", "./master_repository.parquet")  # tip: set to /data/master_repository.parquet on Railway
-ACTIVITY_LOG_PATH = os.environ.get("ACTIVITY_LOG_PATH", "/data/fill_activity.csv")
+st.set_page_config(page_title="Email Format Filler", layout="wide")
 
-# =========================
-# Column detection helpers
-# =========================
-def match_col(possible_names, df_cols):
-    low_map = {c.lower(): c for c in df_cols}
-    for name in possible_names:
-        if name.lower() in low_map:
-            return low_map[name.lower()]
-    return None
+# ==============================
+# CONSTANTS / CONFIG
+# ==============================
+REPO_PATH = os.environ.get("REPO_PATH", "/data/master_repository.parquet")
+# Valid compact schema for the repository
+REPO_SCHEMA = ["company", "country_norm", "domain", "pattern", "count"]
 
-ALIASES_COMPANY = ["Company","Company Name","Account","Account Name","Organisation","Organization","Company Name for Emails"]
-ALIASES_EMAIL   = ["Email","Email Address","Primary Email","Work Email","Business Email","E-mail","Email(2)"]
-ALIASES_FIRST   = ["First Name","Firstname","Given Name","Forename","First"]
-ALIASES_LAST    = ["Last Name","Lastname","Surname","Family Name","Last"]
-ALIASES_DOMAIN  = ["Domain","Company Domain","Website","Company Website","Company Domain/Website","Domain(2)"]  # optional
-ALIASES_COUNTRY = ["Country","Company Country","Office Country","HQ Country","Country/Region"]                   # optional
-
-SEPARATORS = ["", ".", "_", "-"]
-PATTERN_KEYS = ["first.last","f.lastname","firstname.l","f.l","firstlast","flast","lastfirst","last.f","first"]
-
-COUNTRY_TLD_PREFS = {
-    "ireland":[".ie",".com"],
-    "united kingdom":[".co.uk",".uk",".com"], "uk":[".co.uk",".uk",".com"], "england":[".co.uk",".uk",".com"],
-    "scotland":[".co.uk",".uk",".com"], "wales":[".co.uk",".uk",".com"],
-    "germany":[".de",".com"], "france":[".fr",".com"], "spain":[".es",".com"], "italy":[".it",".com"],
-    "netherlands":[".nl",".com"], "belgium":[".be",".com"], "sweden":[".se",".com"], "norway":[".no",".com"],
-    "denmark":[".dk",".com"], "finland":[".fi",".com"], "poland":[".pl",".com"], "portugal":[".pt",".com"],
-    "austria":[".at",".com"], "switzerland":[".ch",".com"], "czech republic":[".cz",".com"], "czechia":[".cz",".com"],
-    "slovakia":[".sk",".com"], "hungary":[".hu",".com"], "romania":[".ro",".com"], "bulgaria":[".bg",".com"],
-    "greece":[".gr",".com"], "turkey":[".com.tr",".tr",".com"],
-    "united states":[".com",".us"], "usa":[".com",".us"], "canada":[".ca",".com"],
-    "australia":[".com.au",".au",".com"], "new zealand":[".co.nz",".nz",".com"]
+# ==============================
+# NORMALIZERS (used everywhere)
+# ==============================
+LEGAL_STOPWORDS = {
+    "the","group","holding","holdings","international","company","co","inc","incorporated",
+    "limited","ltd","plc","llc","llp","gmbh","ag","sa","spa","srl","bv","nv","as","ab","oy","aps",
+    "kft","zrt","rt","sarl","sas","pte","pty","bhd","sdn","kk","dmcc","pjsc","jsc","ltda",
+    "corp","corporation","co."
 }
 
-def clean_string(x):
-    if pd.isna(x): return pd.NA
-    s = str(x).strip()
-    return s if s else pd.NA
+def normalize_company_key(name: str) -> str:
+    """Canonical company key used in both repo build and fill."""
+    if not isinstance(name, str) or not name.strip():
+        return ""
+    s = unidecode(name).lower()
+    s = re.sub(r"[^a-z0-9\s-]", " ", s)
+    toks = [t for t in re.split(r"[\s-]+", s) if t]
+    toks = [t for t in toks if t not in LEGAL_STOPWORDS]
+    return "".join(toks)
 
 def normalize_country(x):
-    if pd.isna(x): return None
-    s = str(x).strip().lower()
-    return s or None
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return None
+    s = unidecode(str(x)).strip().lower()
+    if not s:
+        return None
+    # light aliasing
+    alias = {
+        "u.s.": "united states",
+        "usa": "united states",
+        "uk": "united kingdom",
+    }
+    return alias.get(s, s)
 
 def norm_name(x):
     if pd.isna(x): return ""
     x = unidecode(str(x)).lower().strip()
     x = re.sub(r"[^\w\s'-]", "", x)
-    x = x.replace("’", "'")
-    base = re.sub(r"[\s'-]+", "", x)
-    return base
+    x = x.replace("’","'")
+    return re.sub(r"[\s'-]+","",x)
 
-def extract_domain(email):
-    if not isinstance(email, str): return None
-    m = re.search(r"@([\w\.-]+\.[A-Za-z]{2,})$", email.strip())
-    return m.group(1).lower() if m else None
+# ==============================
+# REPO IO + MAPS + STATUS
+# ==============================
+@st.cache_resource(show_spinner=False)
+def load_repo_df():
+    """
+    Load the compact repository DataFrame and validate columns.
+    Tries common locations so you don't get path gotchas.
+    """
+    candidates = [
+        REPO_PATH,
+        "./master_repository.parquet",
+        "./master_repository_compact.parquet",
+        "/data/master_repository_compact.parquet",
+    ]
+    last_err = None
+    for p in candidates:
+        try:
+            if os.path.exists(p):
+                df = pd.read_parquet(p)
+                # validate schema (order not enforced)
+                if sorted(df.columns.tolist()) != sorted(REPO_SCHEMA):
+                    raise ValueError(
+                        f"Wrong repo columns at {p}. Found {df.columns.tolist()}, "
+                        f"expected {REPO_SCHEMA}."
+                    )
+                return df, p
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(
+        f"Unable to load a valid repository from {candidates}. "
+        f"Last error: {last_err}"
+    )
 
-def local_part(email):
-    if not isinstance(email, str) or "@" not in email: return None
-    return email.split("@",1)[0].lower().strip()
+def repository_status_box():
+    try:
+        repo_df, path = load_repo_df()
+        with st.expander("📦 Repository status", expanded=True):
+            st.write({
+                "path": path,
+                "rows": int(len(repo_df)),
+                "unique_companies": int(repo_df["company"].nunique()),
+                "columns": repo_df.columns.tolist()
+            })
+            st.caption("Schema must be exactly these columns (any order): "
+                       "['company','country_norm','domain','pattern','count']")
+    except Exception as e:
+        st.error(f"Repository load failed: {e}")
+        st.stop()
 
-def pattern_candidates(first, last):
-    f = norm_name(first); l = norm_name(last)
-    fi = f[:1]; li = l[:1]
-    cands = []
-    for sep in SEPARATORS:
-        cands.extend([
-            ("first.last", f"{f}{sep}{l}"),
-            ("f.lastname", f"{fi}{sep}{l}"),
-            ("firstname.l", f"{f}{sep}{li}"),
-            ("f.l",        f"{fi}{sep}{li}"),
-            ("firstlast",  f"{f}{l}"),
-            ("flast",      f"{fi}{l}"),
-            ("lastfirst",  f"{l}{f}"),
-            ("last.f",     f"{l}{sep}{fi}"),
-            ("first",      f"{f}"),
-        ])
-    seen, uniq = set(), []
-    for k,v in cands:
-        if (k,v) not in seen:
-            seen.add((k,v))
-            uniq.append((k,v))
-    return uniq
-
-def detect_email_pattern(first, last, email):
-    lp = local_part(email)
-    if not lp: return None
-    for key, cand in pattern_candidates(first, last):
-        if lp == cand:
-            return key
-    return None
-
-def generate_email(first, last, pattern_key, domain):
-    f = norm_name(first); l = norm_name(last)
-    fi = f[:1]; li = l[:1]
-    def with_sep(a,b):
-        for sep in [".","_","-"]:
-            return f"{a}{sep}{b}@{domain}"
-        return f"{a}{b}@{domain}"
-    if pattern_key == "first.last": return with_sep(f,l)
-    if pattern_key == "f.lastname": return with_sep(fi,l)
-    if pattern_key == "firstname.l":return with_sep(f,li)
-    if pattern_key == "f.l":        return with_sep(fi,li)
-    if pattern_key == "firstlast":  return f"{f}{l}@{domain}"
-    if pattern_key == "flast":      return f"{fi}{l}@{domain}"
-    if pattern_key == "lastfirst":  return f"{l}{f}@{domain}"
-    if pattern_key == "last.f":     return with_sep(l,fi)
-    if pattern_key == "first":      return f"{f}@{domain}"
-    return None
-
-# =========================
-# Column normalization
-# =========================
-def ensure_cols(df):
-    c_company = match_col(ALIASES_COMPANY, df.columns)
-    c_email   = match_col(ALIASES_EMAIL, df.columns)
-    c_first   = match_col(ALIASES_FIRST, df.columns)
-    c_last    = match_col(ALIASES_LAST, df.columns)
-    c_domain  = match_col(ALIASES_DOMAIN, df.columns)   # optional
-    c_country = match_col(ALIASES_COUNTRY, df.columns)  # optional
-
-    # fallback from Full Name
-    if c_first is None or c_last is None:
-        name_col = match_col(["Name","Full Name"], df.columns)
-        if name_col:
-            names = df[name_col].fillna("").astype(str)
-            first_guess = names.str.split().str[0]
-            last_guess  = names.str.split().str[-1]
-            if c_first is None:
-                df["First Name"] = first_guess; c_first = "First Name"
-            if c_last is None:
-                df["Last Name"]  = last_guess;  c_last  = "Last Name"
-
-    missing = []
-    if c_company is None: missing.append("Company")
-    if c_email   is None: missing.append("Email")
-    if c_first   is None: missing.append("First Name")
-    if c_last    is None: missing.append("Last Name")
-    if missing:
-        raise ValueError(f"Missing required columns: {', '.join(missing)}")
-
-    df = df.rename(columns={
-        c_company: "Company",
-        c_email:   "Email",
-        c_first:   "First Name",
-        c_last:    "Last Name",
-        **({c_domain:"Domain"}  if c_domain  else {}),
-        **({c_country:"Country"} if c_country else {}),
-    })
-
-    df["Company"]    = df["Company"].apply(clean_string)
-    df["Email"]      = df["Email"].replace(r"^\s*$", pd.NA, regex=True)
-    df["Email"]      = df["Email"].replace(["nan","NaN","None","NULL","null"], pd.NA)
-    df["First Name"] = df["First Name"].apply(clean_string)
-    df["Last Name"]  = df["Last Name"].apply(clean_string)
-
-    if "Domain" in df.columns:
-        df["Domain"] = df["Domain"].astype(str).str.strip()
-        df["Domain"] = df["Domain"].replace(r"^\s*$", pd.NA, regex=True)
-        df["Domain"] = df["Domain"].apply(lambda x: re.sub(r"^https?://","",x) if isinstance(x,str) else x)
-        df["Domain"] = df["Domain"].apply(lambda x: x.split("/")[0] if isinstance(x,str) else x)
-        df["Domain"] = df["Domain"].str.lower()
-
-    if "Country" in df.columns:
-        df["Country"] = df["Country"].apply(normalize_country)
-
-    return df
-
-# =========================
-# Repo utilities (persistent)
-# =========================
-REPO_SCHEMA = ["company","country_norm","domain","pattern","count"]
-
-def load_repo():
-    if os.path.exists(REPO_PATH):
-        return pd.read_parquet(REPO_PATH)
-    return pd.DataFrame(columns=REPO_SCHEMA)
-
-def save_repo(df_repo):
-    df_repo = df_repo.copy()
-    if "count" in df_repo.columns:
-        df_repo["count"] = df_repo["count"].astype("int64")
-    df_repo.to_parquet(REPO_PATH, compression="snappy")
-
-def add_examples_to_repo(df_input):
-    """Extract rows WITH emails → (company, country, domain, pattern, count=1), merge into persistent repo."""
-    repo = load_repo()
-    df = ensure_cols(df_input)
-
-    rows = []
-    for _, r in df.dropna(subset=["Email"]).iterrows():
-        company_raw = "" if pd.isna(r["Company"]) else str(r["Company"])
-        company_key = unidecode(company_raw).strip().lower()
-        if not company_key:
-            continue
-
-        country_norm = normalize_country(r["Country"]) if "Country" in df.columns else None
-
-        first = None if pd.isna(r["First Name"]) else r["First Name"]
-        last  = None if pd.isna(r["Last Name"])  else r["Last Name"]
-        email = str(r["Email"]).strip() if not pd.isna(r["Email"]) else None
-        if not email:
-            continue
-
-        dom = extract_domain(email)
-        pat = detect_email_pattern(first, last, email)
-        if company_key and dom and pat:
-            rows.append([company_key, country_norm, dom, pat, 1])
-
-    if not rows:
-        return load_repo()
-
-    new = pd.DataFrame(rows, columns=REPO_SCHEMA)
-    combined = pd.concat([repo, new], ignore_index=True)
-    combined = (combined.groupby(["company","country_norm","domain","pattern"], as_index=False)
-                        .agg(count=("count","sum")))
-    save_repo(combined)
-    return combined
-
-def choose_best_domain(domains, country_norm):
-    if not domains: return None
-    cnt = Counter(domains)
-    if country_norm and country_norm in COUNTRY_TLD_PREFS:
-        for pref in COUNTRY_TLD_PREFS[country_norm]:
-            cands = [d for d in cnt if d.endswith(pref)]
-            if cands:
-                return sorted(cands, key=lambda d: (-cnt[d], d))[0]
-    coms = [d for d in cnt if d.endswith(".com")]
-    if coms:
-        return sorted(coms, key=lambda d: (-cnt[d], d))[0]
-    return sorted(cnt.keys(), key=lambda d: (-cnt[d], d))[0]
-
-def build_maps_from_repo(df_repo):
-    """Build maps for fast lookup."""
-    repo_by_domain = defaultdict(lambda: defaultdict(int))
-    repo_cc = defaultdict(lambda: defaultdict(list))
-    repo_c  = defaultdict(lambda: defaultdict(list))
-    for _, r in df_repo.iterrows():
-        company = r["company"]; country_norm = r["country_norm"]
-        dom = r["domain"]; pat = r["pattern"]; count = int(r["count"])
-        repo_by_domain[dom][pat] += count
-        for _i in range(count):
-            repo_c[company][pat].append(dom)
-            if country_norm:
-                key = f"{company}|{country_norm}"
-                repo_cc[key][pat].append(dom)
-    return repo_by_domain, repo_cc, repo_c
-
-def learn_from_dataset(df):
-    df = ensure_cols(df)
-    cc = defaultdict(lambda: defaultdict(list))
-    c  = defaultdict(lambda: defaultdict(list))
-    for _, r in df.dropna(subset=["Email"]).iterrows():
-        company_raw = "" if pd.isna(r["Company"]) else str(r["Company"])
-        company = unidecode(company_raw).strip().lower()
-        if not company:
-            continue
-        country_norm = normalize_country(r["Country"]) if "Country" in df.columns else None
-
-        first = None if pd.isna(r["First Name"]) else r["First Name"]
-        last  = None if pd.isna(r["Last Name"])  else r["Last Name"]
-        email = str(r["Email"]).strip() if not pd.isna(r["Email"]) else None
-        if not email:
-            continue
-
-        dom = extract_domain(email); pat = detect_email_pattern(first, last, email)
-        if company and dom and pat:
-            c[company][pat].append(dom)
-            if country_norm:
-                cc[f"{company}|{country_norm}"][pat].append(dom)
+def build_repo_maps(repo_df: pd.DataFrame):
+    """
+    Build fast lookup structures:
+      - repo_cc[(company_key, country_norm)] -> Counter{(pattern,domain): count}
+      - repo_c[company_key] -> Counter{(pattern,domain): count}
+    """
+    cc = defaultdict(Counter)
+    c  = defaultdict(Counter)
+    # vectorized-ish iteration
+    for company, ctry, dom, pat, cnt in repo_df[["company","country_norm","domain","pattern","count"]].itertuples(index=False):
+        cnt = int(cnt) if pd.notna(cnt) else 1
+        cc[(company, ctry)][(pat, dom)] += cnt
+        c[company][(pat, dom)] += cnt
     return cc, c
 
-def best_from_sources(company_key, country_norm, repo_cc, repo_c, cc_data, c_data):
-    # company+country → repo then data
-    if country_norm:
-        key = f"{company_key}|{country_norm}"
-        for src_tag, src in (("REPO company+country", repo_cc), ("DATA company+country", cc_data)):
-            if key in src and src[key]:
-                fmt_counts = {k: len(v) for k,v in src[key].items() if v}
-                if fmt_counts:
-                    pat = max(fmt_counts, key=fmt_counts.get)
-                    best_dom = choose_best_domain(src[key][pat], country_norm)
-                    if best_dom: return pat, best_dom, src_tag
-    # company only → repo then data
-    for src_tag, src in (("REPO company", repo_c), ("DATA company", c_data)):
-        if company_key in src and src[company_key]:
-            fmt_counts = {k: len(v) for k,v in src[company_key].items() if v}
-            if fmt_counts:
-                pat = max(fmt_counts, key=fmt_counts.get)
-                best_dom = choose_best_domain(src[company_key][pat], country_norm)
-                if best_dom: return pat, best_dom, src_tag
-    return None, None, None
-
-def fill_missing_emails(df, learn_from_this_file=False, progress_cb=None):
-    df = ensure_cols(df)
-
-    # audit columns
-    for col in ["Email_Filled","Email_Fill_Reason","Email_Pattern_Detected","Domain_Guess"]:
-        if col not in df.columns: df[col] = pd.NA
-    df["Email_Filled"] = df["Email_Filled"].fillna("No")
-
-    missing_before = int(df["Email"].isna().sum())
-
-    # learn from this file first (incremental)
-    if learn_from_this_file:
-        add_examples_to_repo(df)
-
-    repo_df = load_repo()
-    _, repo_cc, repo_c = build_maps_from_repo(repo_df)
-    cc_data, c_data = learn_from_dataset(df)
-
-    # fill with progress
-    to_fill = df.index[df["Email"].isna()].tolist()
-    total = len(to_fill)
-    filled_counter = 0
-
-    for i, idx in enumerate(to_fill, start=1):
-        r = df.loc[idx]
-
-        company_raw = "" if pd.isna(r["Company"]) else str(r["Company"])
-        company_key = unidecode(company_raw).strip().lower()
-        if not company_key:
-            if progress_cb: progress_cb(i, total)
-            continue
-
-        first = None if pd.isna(r["First Name"]) else r["First Name"]
-        last  = None if pd.isna(r["Last Name"])  else r["Last Name"]
-        if first is None or last is None:
-            if progress_cb: progress_cb(i, total)
-            continue
-
-        country_norm = normalize_country(r["Country"]) if "Country" in df.columns else None
-
-        pat, domain, src_tag = best_from_sources(company_key, country_norm, repo_cc, repo_c, cc_data, c_data)
-        if pat and domain:
-            email = generate_email(first, last, pat, domain)
-            if email:
-                df.at[idx,"Email"] = email
-                df.at[idx,"Email_Filled"] = "Yes"
-                df.at[idx,"Email_Fill_Reason"] = f"Filled via {src_tag} (pattern '{pat}', domain '{domain}')"
-                df.at[idx,"Domain_Guess"] = domain
-                filled_counter += 1
-
-        if progress_cb:
-            progress_cb(i, total)
-
-    # audit: existing emails → pattern + domain guess
-    detected = []
-    for i2, r2 in df.iterrows():
-        if pd.isna(r2["Email"]):
-            detected.append(pd.NA)
-        else:
-            first2 = None if pd.isna(r2["First Name"]) else r2["First Name"]
-            last2  = None if pd.isna(r2["Last Name"])  else r2["Last Name"]
-            detected.append(detect_email_pattern(first2, last2, r2["Email"]))
-            dom2 = extract_domain(r2["Email"])
-            if dom2 and (("Domain_Guess" not in df.columns) or pd.isna(r2.get("Domain_Guess", pd.NA))):
-                df.at[i2,"Domain_Guess"] = dom2
-    df["Email_Pattern_Detected"] = detected
-
-    missing_after = int(df["Email"].isna().sum())
-    stats = {
-        "rows": int(len(df)),
-        "missing_before": missing_before,
-        "filled": int(filled_counter),
-        "missing_after": missing_after,
-        "fill_rate_pct": (filled_counter / missing_before * 100.0) if missing_before else 0.0
-    }
-    return df, stats
-
-# =========================
-# File loader
-# =========================
-def load_df(uploaded_file):
-    if uploaded_file is None: return None
-    name = uploaded_file.name if hasattr(uploaded_file, "name") else str(uploaded_file)
-    ext = os.path.splitext(name)[1].lower()
-    if ext in [".xlsx",".xlsm",".xltx",".xltm",".xls"]:
-        return pd.read_excel(uploaded_file)
-    if ext == ".csv":
-        return pd.read_csv(uploaded_file, keep_default_na=True, low_memory=False)
-    if ext in [".parquet",".pq"]:
-        return pd.read_parquet(uploaded_file)
-    st.error(f"Unsupported file type: {ext}")
+# ==============================
+# CSV/XLSX column detection
+# ==============================
+def find_col(df, options):
+    low = {c.lower(): c for c in df.columns}
+    for o in options:
+        if o.lower() in low:
+            return low[o.lower()]
     return None
 
-# =========================
-# Streamlit UI
-# =========================
-st.set_page_config(page_title="Email Format Filler", layout="wide")
-st.title("Email Format Filler (Persistent Repository)")
+def detect_columns(df):
+    c_company = find_col(df, ["Company","Company Name","Company Name for Emails","Account","Organisation"])
+    c_email   = find_col(df, ["Email","Primary Email","Work Email","Business Email","E-mail"])
+    c_first   = find_col(df, ["First Name","Firstname","Given Name","Forename"])
+    c_last    = find_col(df, ["Last Name","Lastname","Surname","Family Name"])
+    c_country = find_col(df, ["Country","Company Country","Office Country","HQ Country","Country/Region"])
+    return c_company, c_email, c_first, c_last, c_country
 
-tab_init, tab_fill = st.tabs(["Initialize / Replace Master", "Fill Missing Emails"])
+# ==============================
+# EMAIL GENERATION
+# ==============================
+def generate_email(first, last, fmt, domain):
+    if pd.isna(first) or pd.isna(last) or not domain:
+        return None
+    f = norm_name(first); l = norm_name(last)
+    if not f or not l:
+        return None
+    fi, li = f[:1], l[:1]
+    if   fmt == 'first.last': return f"{f}.{l}@{domain}"
+    elif fmt == 'f.lastname': return f"{fi}.{l}@{domain}"
+    elif fmt == 'firstname.l': return f"{f}.{li}@{domain}"
+    elif fmt == 'f.l':        return f"{fi}.{li}@{domain}"
+    elif fmt == 'firstlast':  return f"{f}{l}@{domain}"
+    elif fmt == 'flast':      return f"{fi}{l}@{domain}"
+    elif fmt == 'lastfirst':  return f"{l}{f}@{domain}"
+    elif fmt == 'last.f':     return f"{l}.{fi}@{domain}"
+    elif fmt == 'first':      return f"{f}@{domain}"
+    return None
 
-with tab_init:
-    st.markdown("Upload your large master **once**. We’ll parse what we need and save a compact repository to persistent storage.")
-    master = st.file_uploader("Master Repository (CSV/XLSX/Parquet)", type=["csv","xlsx","xls","parquet","pq"])
-    colA, colB = st.columns([1,1])
-    with colA:
-        if st.button("Build / Replace Persistent Repository", type="primary", use_container_width=True):
-            if not master:
-                st.error("Please upload a Master Repository file.")
-            else:
-                df = load_df(master)
-                repo = add_examples_to_repo(df)
-                save_repo(repo)
-                st.success("Repository built and saved.")
-                st.write({
-                    "unique_keys": int(repo.shape[0]),
-                    "total_examples": int(repo["count"].sum()) if not repo.empty else 0
-                })
-    with colB:
-        if st.button("Download Current Repository", use_container_width=True):
-            repo = load_repo()
-            if repo.empty:
-                st.warning("Repository is empty.")
-            else:
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".parquet")
-                repo.to_parquet(tmp.name, compression="snappy")
-                with open(tmp.name, "rb") as f:
-                    st.download_button("Download .parquet", f, file_name="master_repository.parquet", mime="application/octet-stream")
+# ==============================
+# PRE-FLIGHT REACH STATS
+# ==============================
+def calc_repo_reach(df, c_company, c_country, repo_cc, repo_c):
+    n_total = int(len(df))
+    if not c_company:
+        return {"rows_in_file": n_total, "rows_with_company": 0,
+                "repo_hits_company_country": 0, "repo_hits_company_only": 0, "repo_misses": n_total}
 
-with tab_fill:
-    st.markdown("Upload a working Apollo-style file (blank emails allowed). Optionally **learn** from known emails in this file, then fill the blanks.")
-    work = st.file_uploader("Working Dataset (CSV/XLSX)", type=["csv","xlsx","xls"], key="work")
-    learn = st.checkbox("Learn from this file (add existing emails to the repository)", value=True)
-    out_fmt = st.radio("Output format", ["Excel (.xlsx)","CSV (.csv)"], horizontal=True)
+    comp_keys = df[c_company].fillna("").map(normalize_company_key)
+    cnorms    = df[c_country].map(normalize_country) if c_country else pd.Series([None]*len(df))
 
-    if st.button("Run Fill", type="primary"):
-        if not work:
-            st.error("Please upload a Working Dataset.")
+    hits_cc = 0; hits_c = 0
+    for ck, ct in zip(comp_keys, cnorms):
+        if ck:
+            if repo_cc.get((ck, ct)):
+                hits_cc += 1
+            elif repo_c.get(ck):
+                hits_c += 1
+    return {
+        "rows_in_file": n_total,
+        "rows_with_company": int(df[c_company].notna().sum()) if c_company else 0,
+        "repo_hits_company_country": hits_cc,
+        "repo_hits_company_only": hits_c,
+        "repo_misses": n_total - (hits_cc + hits_c)
+    }
+
+# ==============================
+# FILL LOOP (repo-first)
+# ==============================
+def fill_missing_emails(df, c_company, c_email, c_first, c_last, c_country, repo_cc, repo_c):
+    out = df.copy()
+    filled_rows = 0
+    src_repo_cc = 0
+    src_repo_c  = 0
+
+    if not all([c_company, c_email, c_first, c_last]):
+        raise ValueError("Missing required columns — need Company, Email, First Name, Last Name.")
+
+    n = len(out)
+    mask_missing = out[c_email].isna() | (out[c_email].astype(str).str.strip().eq(""))
+    rows = out[mask_missing].index.tolist()
+
+    prog = st.progress(0)
+    status = st.empty()
+
+    for i, idx in enumerate(rows, 1):
+        row = out.loc[idx]
+        ckey = normalize_company_key(row[c_company])
+        cnrm = normalize_country(row[c_country]) if c_country else None
+        first, last = row[c_first], row[c_last]
+
+        new_email = None
+
+        # 1) repo (company+country)
+        hit_cc = repo_cc.get((ckey, cnrm))
+        if hit_cc:
+            (pat, dom), _ = max(hit_cc.items(), key=lambda kv: kv[1])
+            new_email = generate_email(first, last, pat, dom)
+            if new_email:
+                src_repo_cc += 1
+
+        # 2) repo (company only) fallback
+        if new_email is None:
+            hit_c = repo_c.get(ckey)
+            if hit_c:
+                (pat, dom), _ = max(hit_c.items(), key=lambda kv: kv[1])
+                new_email = generate_email(first, last, pat, dom)
+                if new_email:
+                    src_repo_c += 1
+
+        if new_email:
+            out.at[idx, c_email] = new_email
+            filled_rows += 1
+
+        if i % 25 == 0 or i == len(rows):
+            prog.progress(int(i/len(rows)*100))
+            status.text(f"Processed {i}/{len(rows)} missing rows … Filled so far: {filled_rows}")
+
+    prog.progress(100)
+    status.empty()
+    return out, {"filled": filled_rows, "src_repo_cc": src_repo_cc, "src_repo_c": src_repo_c, "considered": len(rows)}
+
+# ==============================
+# UI
+# ==============================
+st.title("Email Format Filler (Persistent Repository) — Debug Build")
+
+# Repo status (hard stop if invalid)
+repository_status_box()
+repo_df, repo_path = load_repo_df()
+repo_cc, repo_c = build_repo_maps(repo_df)
+
+st.write("---")
+st.header("Fill Missing Emails")
+
+uploaded = st.file_uploader("Upload a CSV/XLSX exported from Apollo (or similar).",
+                            type=["csv","xlsx","xls"])
+if uploaded:
+    # Load file keeping all cols
+    if uploaded.name.lower().endswith(".csv"):
+        df = pd.read_csv(uploaded, keep_default_na=True, low_memory=False)
+    else:
+        df = pd.read_excel(uploaded, engine="openpyxl")
+
+    st.success(f"Loaded file: {df.shape[0]:,} rows × {df.shape[1]:,} columns")
+
+    # Detect columns
+    c_company, c_email, c_first, c_last, c_country = detect_columns(df)
+    cols_found = {
+        "Company": c_company, "Email": c_email, "First Name": c_first,
+        "Last Name": c_last, "Country": c_country
+    }
+    st.write("**Detected columns**", cols_found)
+
+    # Pre-flight reach
+    stats = calc_repo_reach(df, c_company, c_country, repo_cc, repo_c)
+    st.info({
+        "rows_in_file": stats["rows_in_file"],
+        "rows_with_company": stats["rows_with_company"],
+        "repo_hits_company_country (pre-flight)": stats["repo_hits_company_country"],
+        "repo_hits_company_only (pre-flight)": stats["repo_hits_company_only"],
+        "repo_misses_pre_flight": stats["repo_misses"]
+    })
+
+    # Misses preview
+    with st.expander("🔍 Show first 15 repo misses (normalized keys)"):
+        misses = []
+        if c_company:
+            comp_keys = df[c_company].fillna("").map(normalize_company_key)
+            cnorms    = df[c_country].map(normalize_country) if c_country else pd.Series([None]*len(df))
+            for i, (ck, ct) in enumerate(zip(comp_keys, cnorms)):
+                if not ck:
+                    continue
+                if not repo_cc.get((ck, ct)) and not repo_c.get(ck):
+                    misses.append({"row_index": i, "company_norm": ck, "country_norm": ct})
+                    if len(misses) >= 15:
+                        break
+        if misses:
+            st.dataframe(pd.DataFrame(misses))
         else:
-            df_in = load_df(work)
+            st.write("No misses found in the first sample.")
 
-            # progress UI
-            prog = st.progress(0)
-            status_txt = st.empty()
-
-            def progress_cb(done, total):
-                if total > 0:
-                    prog.progress(min(1.0, done/total))
-                    status_txt.write(f"Processing {done:,} / {total:,} missing emails...")
-
-            result, stats = fill_missing_emails(df_in, learn_from_this_file=learn, progress_cb=progress_cb)
-
-            # finish progress
-            prog.progress(1.0)
-            status_txt.write("Processing complete.")
-
-            # summary metrics
-            st.success(f"Filled {stats['filled']:,} of {stats['missing_before']:,} missing emails "
-                       f"({stats['fill_rate_pct']:.1f}%). Remaining missing: {stats['missing_after']:,}.")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total rows", f"{stats['rows']:,}")
-            c2.metric("Filled", f"{stats['filled']:,}")
-            c3.metric("Fill rate", f"{stats['fill_rate_pct']:.1f}%")
-
-            # optional: append run to activity log
-            try:
-                log_row = pd.DataFrame([{
-                    "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                    "rows": stats["rows"],
-                    "missing_before": stats["missing_before"],
-                    "filled": stats["filled"],
-                    "missing_after": stats["missing_after"],
-                    "fill_rate_pct": round(stats["fill_rate_pct"], 2),
-                    "learn_from_this_file": bool(learn)
-                }])
-                if os.path.exists(ACTIVITY_LOG_PATH):
-                    log_row.to_csv(ACTIVITY_LOG_PATH, mode="a", header=False, index=False)
-                else:
-                    log_row.to_csv(ACTIVITY_LOG_PATH, index=False)
-                st.caption(f"Run logged to {ACTIVITY_LOG_PATH}")
-            except Exception as e:
-                st.caption(f"Could not write activity log: {e}")
-
-            # preview + download
-            st.dataframe(result.head(100), use_container_width=True)
-
-            if out_fmt.startswith("Excel"):
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-                result.to_excel(tmp.name, index=False)
-                with open(tmp.name, "rb") as f:
-                    st.download_button("Download result (.xlsx)", f, file_name="emails_filled.xlsx",
-                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    # Live lookup
+    with st.expander("🧪 Test a repository lookup"):
+        comp_in = st.text_input("Company (as it appears in your file)")
+        country_in = st.text_input("Country (optional)")
+        if st.button("Lookup"):
+            ck = normalize_company_key(comp_in)
+            ct = normalize_country(country_in) if country_in else None
+            cc_hit = repo_cc.get((ck, ct))
+            c_hit  = repo_c.get(ck)
+            if cc_hit:
+                (pat, dom), cnt = max(cc_hit.items(), key=lambda kv: kv[1])
+                st.success(f"Match by (company,country): pattern={pat}, domain={dom}, weight={cnt}")
+            elif c_hit:
+                (pat, dom), cnt = max(c_hit.items(), key=lambda kv: kv[1])
+                st.warning(f"Match by company only: pattern={pat}, domain={dom}, weight={cnt}")
             else:
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
-                result.to_csv(tmp.name, index=False)
-                with open(tmp.name, "rb") as f:
-                    st.download_button("Download result (.csv)", f, file_name="emails_filled.csv", mime="text/csv")
+                st.error(f"No repo match. normalized_company='{ck}', normalized_country='{ct}'")
+
+    st.write("---")
+    run = st.button("▶️ Run Fill (repo-first)")
+    if run:
+        try:
+            result_df, fill_stats = fill_missing_emails(
+                df, c_company, c_email, c_first, c_last, c_country, repo_cc, repo_c
+            )
+            filled = fill_stats["filled"]
+            considered = fill_stats["considered"]
+            st.success(f"Filled {filled:,} of {considered:,} missing emails "
+                       f"({(filled/considered*100 if considered else 0):.1f}%).")
+            st.write({
+                "from_repo_company_country": fill_stats["src_repo_cc"],
+                "from_repo_company_only": fill_stats["src_repo_c"],
+            })
+
+            # Download
+            b = io.BytesIO()
+            # default to CSV to keep size small
+            result_df.to_csv(b, index=False)
+            st.download_button("⬇️ Download CSV", b.getvalue(), file_name="emails_filled.csv", mime="text/csv")
+        except Exception as e:
+            st.error(f"Run failed: {e}")
+
+else:
+    st.caption("Upload a CSV/XLSX to begin.")
