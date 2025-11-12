@@ -1,4 +1,5 @@
-# main.py — Email Format Filler (Persistent Repository, no repo-upload UI)
+# main.py — Email Format Filler
+# Hybrid strategy: (1) infer from UPLOADED FILE, then (2) fall back to PERSISTENT REPOSITORY
 
 import os, re, io
 from collections import defaultdict, Counter
@@ -7,26 +8,20 @@ import pandas as pd
 import streamlit as st
 from unidecode import unidecode
 
-st.set_page_config(page_title="Email Format Filler", layout="wide")
+st.set_page_config(page_title="Email Format Filler — Hybrid", layout="wide")
 
-# ------------------------------------------------------------------
-# CONFIG
-# ------------------------------------------------------------------
-# Where to look for the compact repository parquet.
-# You can override with Railway env var REPO_PATH.
-REPO_PATH = os.environ.get("REPO_PATH", "/data/master_repository.parquet")
-REPO_SCHEMA = ["company", "country_norm", "domain", "pattern", "count"]
-
-CANDIDATE_PATHS = [
-    REPO_PATH,
+# -----------------------------
+# Config / Paths
+# -----------------------------
+CANDIDATE_REPO_PATHS = [
+    os.environ.get("REPO_PATH", ""),  # allow override
     "./master_repository.parquet",
     "./master_repository_compact.parquet",
+    "/data/master_repository.parquet",
     "/data/master_repository_compact.parquet",
 ]
+REPO_SCHEMA = ["company", "country_norm", "domain", "pattern", "count"]
 
-# ------------------------------------------------------------------
-# NORMALIZERS (shared with repo build)
-# ------------------------------------------------------------------
 LEGAL_STOPWORDS = {
     "the","group","holding","holdings","international","company","co","inc","incorporated",
     "limited","ltd","plc","llc","llp","gmbh","ag","sa","spa","srl","bv","nv","as","ab","oy","aps",
@@ -34,6 +29,9 @@ LEGAL_STOPWORDS = {
     "corp","corporation","co."
 }
 
+# -----------------------------
+# Normalizers
+# -----------------------------
 def normalize_company_key(name: str) -> str:
     if not isinstance(name, str) or not name.strip():
         return ""
@@ -52,7 +50,11 @@ def normalize_country(x):
     alias = {
         "u.s.": "united states",
         "usa": "united states",
+        "u.k.": "united kingdom",
         "uk": "united kingdom",
+        "england": "united kingdom",
+        "gb": "united kingdom",
+        "great britain": "united kingdom",
     }
     return alias.get(s, s)
 
@@ -63,30 +65,78 @@ def norm_name(x):
     x = x.replace("’","'")
     return re.sub(r"[\s'-]+","",x)
 
-# ------------------------------------------------------------------
-# REPOSITORY LOADING & MAPS
-# ------------------------------------------------------------------
+# -----------------------------
+# Pattern detection on a known email + names
+# -----------------------------
+def detect_email_pattern(first, last, email):
+    """Return canonical pattern string or None based on first/last + email."""
+    if not isinstance(email, str) or "@" not in email:
+        return None
+    local = email.split("@")[0].lower()
+
+    f = norm_name(first)
+    l = norm_name(last)
+    if not f or not l:
+        return None
+
+    cand = [
+        ("first.last", f"{f}.{l}"),
+        ("f.lastname", f"{f[:1]}.{l}"),
+        ("firstname.l", f"{f}.{l[:1]}"),
+        ("f.l", f"{f[:1]}.{l[:1]}"),
+        ("firstlast", f"{f}{l}"),
+        ("flast", f"{f[:1]}{l}"),
+        ("lastfirst", f"{l}{f}"),
+        ("last.f", f"{l}.{f[:1]}"),
+        ("first", f"{f}"),
+    ]
+    for pat, target in cand:
+        if local == target:
+            return pat
+    return None
+
+# -----------------------------
+# Generate from pattern
+# -----------------------------
+def generate_email(first, last, fmt, domain):
+    if pd.isna(first) or pd.isna(last) or not domain:
+        return None
+    f = norm_name(first); l = norm_name(last)
+    if not f or not l:
+        return None
+    fi, li = f[:1], l[:1]
+    if   fmt == 'first.last':   local = f"{f}.{l}"
+    elif fmt == 'f.lastname':   local = f"{fi}.{l}"
+    elif fmt == 'firstname.l':  local = f"{f}.{li}"
+    elif fmt == 'f.l':          local = f"{fi}.{li}"
+    elif fmt == 'firstlast':    local = f"{f}{l}"
+    elif fmt == 'flast':        local = f"{fi}{l}"
+    elif fmt == 'lastfirst':    local = f"{l}{f}"
+    elif fmt == 'last.f':       local = f"{l}.{fi}"
+    elif fmt == 'first':        local = f"{f}"
+    else: return None
+    return f"{local}@{domain}"
+
+# -----------------------------
+# Repo loading
+# -----------------------------
 @st.cache_resource(show_spinner=False)
 def load_repo_df():
     last_err = None
-    for p in CANDIDATE_PATHS:
+    for p in [p for p in CANDIDATE_REPO_PATHS if p]:
         try:
             if os.path.exists(p):
                 df = pd.read_parquet(p)
                 if sorted(df.columns.tolist()) != sorted(REPO_SCHEMA):
                     raise ValueError(
-                        f"Wrong columns in {p}. Found {df.columns.tolist()}, "
-                        f"expected {REPO_SCHEMA}."
+                        f"Wrong columns in {p}. Found {df.columns.tolist()}, expected {REPO_SCHEMA}."
                     )
                 return df, p
         except Exception as e:
             last_err = e
-    raise RuntimeError(
-        f"Unable to load a valid repository from {CANDIDATE_PATHS}. "
-        f"Last error: {last_err}"
-    )
+    return None, f"Unable to load a valid repository from {CANDIDATE_REPO_PATHS}. Last error: {last_err}"
 
-def build_repo_maps(repo_df: pd.DataFrame):
+def build_maps_from_repo(repo_df: pd.DataFrame):
     cc = defaultdict(Counter)  # (company,country) -> Counter[(pattern,domain)]
     c  = defaultdict(Counter)  # company -> Counter[(pattern,domain)]
     for company, ctry, dom, pat, cnt in repo_df[["company","country_norm","domain","pattern","count"]].itertuples(index=False):
@@ -95,19 +145,34 @@ def build_repo_maps(repo_df: pd.DataFrame):
         c[company][(pat, dom)] += cnt
     return cc, c
 
-def repository_status_box(repo_df: pd.DataFrame, repo_path: str):
-    with st.expander("📦 Repository status", expanded=True):
-        st.write({
-            "path": repo_path,
-            "rows": int(len(repo_df)),
-            "unique_companies": int(repo_df["company"].nunique()),
-            "columns": repo_df.columns.tolist()
-        })
-        st.caption("Repository must have schema: ['company','country_norm','domain','pattern','count'].")
+# -----------------------------
+# Build maps from the uploaded file (LOCAL inference)
+# -----------------------------
+def build_maps_from_local(df, c_company, c_email, c_first, c_last, c_country):
+    cc_local = defaultdict(Counter)
+    c_local  = defaultdict(Counter)
 
-# ------------------------------------------------------------------
-# INPUT COLUMN DETECTION
-# ------------------------------------------------------------------
+    if not all([c_company, c_email, c_first, c_last]):
+        return cc_local, c_local
+
+    present = df[(df[c_email].notna()) & (df[c_email].astype(str).str.contains("@"))]
+    for _, row in present.iterrows():
+        comp = normalize_company_key(row[c_company])
+        if not comp:
+            continue
+        email = str(row[c_email]).strip().lower()
+        domain = email.split("@")[1] if "@" in email else None
+        pat = detect_email_pattern(row[c_first], row[c_last], email)
+        if not domain or not pat:
+            continue
+        ctry = normalize_country(row[c_country]) if c_country else None
+        cc_local[(comp, ctry)][(pat, domain)] += 1
+        c_local[comp][(pat, domain)] += 1
+    return cc_local, c_local
+
+# -----------------------------
+# Helpers
+# -----------------------------
 def find_col(df, options):
     low = {c.lower(): c for c in df.columns}
     for o in options:
@@ -123,138 +188,156 @@ def detect_columns(df):
     c_country = find_col(df, ["Country","Company Country","Office Country","HQ Country","Country/Region"])
     return c_company, c_email, c_first, c_last, c_country
 
-# ------------------------------------------------------------------
-# EMAIL GENERATION
-# ------------------------------------------------------------------
-def generate_email(first, last, fmt, domain):
-    if pd.isna(first) or pd.isna(last) or not domain:
+def choose_best(counter: Counter):
+    """Pick the most common (pattern,domain). If tied, prefer .com."""
+    if not counter:
         return None
-    f = norm_name(first); l = norm_name(last)
-    if not f or not l:
-        return None
-    fi, li = f[:1], l[:1]
-    if   fmt == 'first.last':   return f"{f}.{l}@{domain}"
-    elif fmt == 'f.lastname':   return f"{fi}.{l}@{domain}"
-    elif fmt == 'firstname.l':  return f"{f}.{li}@{domain}"
-    elif fmt == 'f.l':          return f"{fi}.{li}@{domain}"
-    elif fmt == 'firstlast':    return f"{f}{l}@{domain}"
-    elif fmt == 'flast':        return f"{fi}{l}@{domain}"
-    elif fmt == 'lastfirst':    return f"{l}{f}@{domain}"
-    elif fmt == 'last.f':       return f"{l}.{fi}@{domain}"
-    elif fmt == 'first':        return f"{f}@{domain}"
-    return None
+    items = counter.most_common()
+    best, best_count = items[0]
+    # tie-breaker: prefer .com domain if counts equal
+    ties = [x for x in items if x[1] == best_count]
+    if len(ties) > 1:
+        for (pat, dom), _ in ties:
+            if dom.endswith(".com"):
+                return (pat, dom)
+    return best
 
-# ------------------------------------------------------------------
-# PRE-FLIGHT REPO REACH
-# ------------------------------------------------------------------
-def calc_repo_reach(df, c_company, c_country, repo_cc, repo_c):
-    n_total = int(len(df))
+# -----------------------------
+# Pre-flight reach
+# -----------------------------
+def calc_reach(df, c_company, c_country, cc_local, c_local, cc_repo, c_repo):
+    n = len(df)
     if not c_company:
-        return {"rows_in_file": n_total, "rows_with_company": 0,
-                "repo_hits_company_country": 0, "repo_hits_company_only": 0, "repo_misses": n_total}
+        return {"rows_in_file": n, "rows_with_company": 0,
+                "local_hits_cc":0,"local_hits_c":0,"repo_hits_cc":0,"repo_hits_c":0}
 
     comp_keys = df[c_company].fillna("").map(normalize_company_key)
     cnorms    = df[c_country].map(normalize_country) if c_country else pd.Series([None]*len(df))
 
-    hits_cc = 0; hits_c = 0
+    loc_cc=loc_c=rep_cc=rep_c=0
     for ck, ct in zip(comp_keys, cnorms):
-        if ck:
-            if repo_cc.get((ck, ct)):
-                hits_cc += 1
-            elif repo_c.get(ck):
-                hits_c += 1
+        if not ck: 
+            continue
+        if cc_local.get((ck, ct)): loc_cc += 1
+        elif c_local.get(ck):      loc_c  += 1
+        elif cc_repo.get((ck, ct)):rep_cc += 1
+        elif c_repo.get(ck):       rep_c  += 1
     return {
-        "rows_in_file": n_total,
-        "rows_with_company": int(df[c_company].notna().sum()) if c_company else 0,
-        "repo_hits_company_country": hits_cc,
-        "repo_hits_company_only": hits_c,
-        "repo_misses": n_total - (hits_cc + hits_c)
+        "rows_in_file": n,
+        "rows_with_company": int(df[c_company].notna().sum()),
+        "local_hits_cc": loc_cc,
+        "local_hits_c": loc_c,
+        "repo_hits_cc": rep_cc,
+        "repo_hits_c": rep_c
     }
 
-# ------------------------------------------------------------------
-# FILL (repo-first)
-# ------------------------------------------------------------------
-def fill_missing_emails(df, c_company, c_email, c_first, c_last, c_country, repo_cc, repo_c):
+# -----------------------------
+# Fill: LOCAL first, then REPO
+# -----------------------------
+def fill_hybrid(df, c_company, c_email, c_first, c_last, c_country, cc_local, c_local, cc_repo, c_repo):
     out = df.copy()
-    filled_rows = 0
-    src_repo_cc = 0
-    src_repo_c  = 0
+    filled = 0
+    src_local_cc = src_local_c = src_repo_cc = src_repo_c = 0
 
     if not all([c_company, c_email, c_first, c_last]):
         raise ValueError("Missing required columns — need Company, Email, First Name, Last Name.")
 
-    mask_missing = out[c_email].isna() | (out[c_email].astype(str).str.strip().eq(""))
-    rows = out[mask_missing].index.tolist()
+    target_idx = out[(out[c_email].isna()) | (out[c_email].astype(str).str.strip().eq(""))].index.tolist()
+    total = len(target_idx) if target_idx else 1
 
     prog = st.progress(0)
-    status = st.empty()
+    msg  = st.empty()
 
-    total = len(rows) if rows else 1
-    for i, idx in enumerate(rows, 1):
+    for i, idx in enumerate(target_idx, 1):
         row = out.loc[idx]
-        ckey = normalize_company_key(row[c_company])
-        cnrm = normalize_country(row[c_country]) if c_country else None
+        ck = normalize_company_key(row[c_company])
+        if not ck:
+            continue
+        ct = normalize_country(row[c_country]) if c_country else None
         first, last = row[c_first], row[c_last]
-
         new_email = None
 
-        # repo (company+country)
-        hit_cc = repo_cc.get((ckey, cnrm))
-        if hit_cc:
-            (pat, dom), _ = max(hit_cc.items(), key=lambda kv: kv[1])
+        # 1) LOCAL (company + country)
+        best = choose_best(cc_local.get((ck, ct), Counter()))
+        if best:
+            pat, dom = best
             new_email = generate_email(first, last, pat, dom)
-            if new_email:
-                src_repo_cc += 1
+            if new_email: src_local_cc += 1
 
-        # repo (company only)
+        # 2) LOCAL (company only)
         if new_email is None:
-            hit_c = repo_c.get(ckey)
-            if hit_c:
-                (pat, dom), _ = max(hit_c.items(), key=lambda kv: kv[1])
+            best = choose_best(c_local.get(ck, Counter()))
+            if best:
+                pat, dom = best
                 new_email = generate_email(first, last, pat, dom)
-                if new_email:
-                    src_repo_c += 1
+                if new_email: src_local_c += 1
+
+        # 3) REPO (company + country)
+        if new_email is None:
+            best = choose_best(cc_repo.get((ck, ct), Counter()))
+            if best:
+                pat, dom = best
+                new_email = generate_email(first, last, pat, dom)
+                if new_email: src_repo_cc += 1
+
+        # 4) REPO (company only)
+        if new_email is None:
+            best = choose_best(c_repo.get(ck, Counter()))
+            if best:
+                pat, dom = best
+                new_email = generate_email(first, last, pat, dom)
+                if new_email: src_repo_c += 1
 
         if new_email:
             out.at[idx, c_email] = new_email
-            filled_rows += 1
+            filled += 1
 
         if i % 25 == 0 or i == total:
-            prog.progress(int(i/total*100))
-            status.text(f"Processed {i}/{total} missing rows … Filled so far: {filled_rows}")
+            prog.progress(int(i / total * 100))
+            msg.text(f"Processed {i}/{total} missing rows • Filled so far: {filled}")
 
     prog.progress(100)
-    status.empty()
-    return out, {"filled": filled_rows, "src_repo_cc": src_repo_cc, "src_repo_c": src_repo_c, "considered": len(rows)}
+    msg.empty()
+    return out, {
+        "filled": filled,
+        "considered": len(target_idx),
+        "src_local_cc": src_local_cc,
+        "src_local_c": src_local_c,
+        "src_repo_cc": src_repo_cc,
+        "src_repo_c": src_repo_c
+    }
 
-# ------------------------------------------------------------------
-# UI (no repo upload; repo must exist in app image)
-# ------------------------------------------------------------------
-st.title("Email Format Filler — Persistent Repository (No-Upload)")
+# -----------------------------
+# UI
+# -----------------------------
+st.title("Email Format Filler — Persistent Repository (Hybrid: Local → Repo)")
 
-# Load repository or stop with a clear error
-try:
-    repo_df, repo_path = load_repo_df()
-except Exception as e:
-    st.error(f"Repository load failed: {e}")
-    st.stop()
-
-repository_status_box(repo_df, repo_path)
-repo_cc, repo_c = build_repo_maps(repo_df)
+# Load repository (optional, but recommended)
+repo_df, repo_info = load_repo_df()
+if repo_df is None:
+    st.warning(repo_info)
+else:
+    with st.expander("📦 Repository status", expanded=True):
+        st.write({
+            "path": repo_info,
+            "rows": int(len(repo_df)),
+            "unique_companies": int(repo_df["company"].nunique()),
+            "columns": repo_df.columns.tolist()
+        })
 
 st.write("---")
 st.header("Fill Missing Emails")
 
-uploaded = st.file_uploader("Upload your CSV/XLSX (Apollo-style export).", type=["csv","xlsx","xls"])
-if not uploaded:
-    st.caption("Tip: the file must include Company, First Name, Last Name, and an Email column (blank where missing).")
+upl = st.file_uploader("Upload your CSV/XLSX (Apollo-style export).", type=["csv","xlsx","xls"])
+if not upl:
+    st.caption("Must include: Company, First Name, Last Name, and Email (blank where missing). Country is optional but improves accuracy.")
     st.stop()
 
-# Load input file
-if uploaded.name.lower().endswith(".csv"):
-    df = pd.read_csv(uploaded, keep_default_na=True, low_memory=False)
+# Read input
+if upl.name.lower().endswith(".csv"):
+    df = pd.read_csv(upl, keep_default_na=True, low_memory=False)
 else:
-    df = pd.read_excel(uploaded, engine="openpyxl")
+    df = pd.read_excel(upl, engine="openpyxl")
 
 st.success(f"Loaded file: {df.shape[0]:,} rows × {df.shape[1]:,} columns")
 
@@ -265,68 +348,62 @@ st.write("**Detected columns:**", {
     "Last Name": c_last, "Country": c_country
 })
 
-# Pre-flight reach
-stats = calc_repo_reach(df, c_company, c_country, repo_cc, repo_c)
+# Build maps
+cc_local, c_local = build_maps_from_local(df, c_company, c_email, c_first, c_last, c_country)
+if repo_df is not None:
+    cc_repo,  c_repo  = build_maps_from_repo(repo_df)
+else:
+    cc_repo, c_repo = defaultdict(Counter), defaultdict(Counter)
+
+# Pre-flight
+reach = calc_reach(df, c_company, c_country, cc_local, c_local, cc_repo, c_repo)
 st.info({
-    "rows_in_file": stats["rows_in_file"],
-    "rows_with_company": stats["rows_with_company"],
-    "repo_hits_company_country (pre-flight)": stats["repo_hits_company_country"],
-    "repo_hits_company_only (pre-flight)": stats["repo_hits_company_only"],
-    "repo_misses_pre_flight": stats["repo_misses"]
+    "rows_in_file": reach["rows_in_file"],
+    "rows_with_company": reach["rows_with_company"],
+    "local_hits_company_country": reach["local_hits_cc"],
+    "local_hits_company_only": reach["local_hits_c"],
+    "repo_hits_company_country": reach["repo_hits_cc"],
+    "repo_hits_company_only": reach["repo_hits_c"],
 })
 
-# Misses preview (first 15)
-with st.expander("🔍 Show first 15 repo misses (normalized keys)"):
-    misses = []
-    if c_company:
-        comp_keys = df[c_company].fillna("").map(normalize_company_key)
-        cnorms    = df[c_country].map(normalize_country) if c_country else pd.Series([None]*len(df))
-        for i, (ck, ct) in enumerate(zip(comp_keys, cnorms)):
-            if not ck:
-                continue
-            if not repo_cc.get((ck, ct)) and not repo_c.get(ck):
-                misses.append({"row_index": i, "company_norm": ck, "country_norm": ct})
-                if len(misses) >= 15:
-                    break
-    if misses:
-        st.dataframe(pd.DataFrame(misses))
-    else:
-        st.write("No misses found in the inspected sample.")
-
-# Live lookup tester
-with st.expander("🧪 Test a repository lookup"):
-    comp_in = st.text_input("Company (exactly as it appears in your file)")
-    country_in = st.text_input("Country (optional)")
+# Optional: quick tester
+with st.expander("🧪 Test lookup (shows what would be used)"):
+    comp_in   = st.text_input("Company")
+    country_in= st.text_input("Country (optional)")
     if st.button("Lookup"):
         ck = normalize_company_key(comp_in)
         ct = normalize_country(country_in) if country_in else None
-        cc_hit = repo_cc.get((ck, ct))
-        c_hit  = repo_c.get(ck)
-        if cc_hit:
-            (pat, dom), cnt = max(cc_hit.items(), key=lambda kv: kv[1])
-            st.success(f"Match by (company,country): pattern={pat}, domain={dom}, weight={cnt}")
-        elif c_hit:
-            (pat, dom), cnt = max(c_hit.items(), key=lambda kv: kv[1])
-            st.warning(f"Match by company only: pattern={pat}, domain={dom}, weight={cnt}")
-        else:
-            st.error(f"No repo match. normalized_company='{ck}', normalized_country='{ct}'")
+        for label, source in [
+            ("Local (company+country)", cc_local.get((ck, ct))),
+            ("Local (company only)", c_local.get(ck)),
+            ("Repo (company+country)", cc_repo.get((ck, ct))),
+            ("Repo (company only)", c_repo.get(ck)),
+        ]:
+            if source:
+                (pat, dom), cnt = choose_best(source), max(source.values()) if source else (None, 0)
+                st.write(f"**{label}:** pattern={pat}, domain={dom}, weight≈{cnt}")
+            else:
+                st.write(f"**{label}:** none")
 
 st.write("---")
-if st.button("▶️ Run Fill (Repo-first)"):
-    result_df, fill_stats = fill_missing_emails(
-        df, c_company, c_email, c_first, c_last, c_country, repo_cc, repo_c
+if st.button("▶️ Run Fill"):
+    result_df, stats = fill_hybrid(
+        df, c_company, c_email, c_first, c_last, c_country,
+        cc_local, c_local, cc_repo, c_repo
     )
-    filled, considered = fill_stats["filled"], fill_stats["considered"]
+    filled, considered = stats["filled"], stats["considered"]
     st.success(
         f"Filled {filled:,} of {considered:,} missing emails "
         f"({(filled/considered*100 if considered else 0):.1f}%)."
     )
     st.write({
-        "from_repo_company_country": fill_stats["src_repo_cc"],
-        "from_repo_company_only": fill_stats["src_repo_c"],
+        "from_local_company_country": stats["src_local_cc"],
+        "from_local_company_only": stats["src_local_c"],
+        "from_repo_company_country": stats["src_repo_cc"],
+        "from_repo_company_only": stats["src_repo_c"],
     })
 
-    # Download (CSV)
-    buf = io.BytesIO()
-    result_df.to_csv(buf, index=False)
-    st.download_button("⬇️ Download CSV", buf.getvalue(), file_name="emails_filled.csv", mime="text/csv")
+    # Download
+    csv_buf = io.BytesIO()
+    result_df.to_csv(csv_buf, index=False)
+    st.download_button("⬇️ Download CSV", csv_buf.getvalue(), file_name="emails_filled.csv", mime="text/csv")
